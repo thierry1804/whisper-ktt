@@ -1,0 +1,29 @@
+services:
+  whisper-service:
+    build: .
+    expose:
+      - "8140"
+    environment:
+      - API_KEY=${API_KEY}
+    volumes:
+      - ./output:/data/output
+      - hf-cache:/data/hf-cache
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - whisper-service
+    restart: unless-stopped
+
+volumes:
+  hf-cache:
+  caddy-data:
+  caddy-config:

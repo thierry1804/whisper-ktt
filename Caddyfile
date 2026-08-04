@@ -1,0 +1,3 @@
+sous-titres.votre-domaine.tld {
+    reverse_proxy whisper-service:8140
+}
