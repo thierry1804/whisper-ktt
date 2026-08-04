@@ -10,6 +10,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
 from transcriber import Transcriber, to_srt, to_vtt
 
@@ -110,28 +111,42 @@ async def get_job(job_id: str):
     return job
 
 
-def _job_file(job_id: str, attr: str) -> Path:
+def _job_file(job_id: str, attr: str) -> tuple[Job, Path]:
     job = JOBS.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job inconnu")
     if job.status != Status.done:
         raise HTTPException(status_code=409, detail=f"Job pas encore terminé (status={job.status})")
-    path = Path(getattr(job, attr))
+    value = getattr(job, attr)
+    if value is None:
+        raise HTTPException(status_code=404, detail="Fichier déjà récupéré")
+    path = Path(value)
     if not path.exists():
         raise HTTPException(status_code=404, detail="Fichier introuvable")
-    return path
+    return job, path
+
+
+def _delete_after_send(job: Job, attr: str, path: Path) -> None:
+    path.unlink(missing_ok=True)
+    setattr(job, attr, None)
 
 
 @app.get("/jobs/{job_id}/srt", dependencies=[Depends(require_api_key)])
 async def get_srt(job_id: str):
-    path = _job_file(job_id, "srt_path")
-    return FileResponse(path, media_type="text/plain", filename=f"{job_id}.srt")
+    job, path = _job_file(job_id, "srt_path")
+    return FileResponse(
+        path, media_type="text/plain", filename=f"{job_id}.srt",
+        background=BackgroundTask(_delete_after_send, job, "srt_path", path),
+    )
 
 
 @app.get("/jobs/{job_id}/vtt", dependencies=[Depends(require_api_key)])
 async def get_vtt(job_id: str):
-    path = _job_file(job_id, "vtt_path")
-    return FileResponse(path, media_type="text/vtt", filename=f"{job_id}.vtt")
+    job, path = _job_file(job_id, "vtt_path")
+    return FileResponse(
+        path, media_type="text/vtt", filename=f"{job_id}.vtt",
+        background=BackgroundTask(_delete_after_send, job, "vtt_path", path),
+    )
 
 
 @app.get("/health")
