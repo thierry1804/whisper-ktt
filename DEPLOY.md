@@ -61,9 +61,13 @@ API_KEY=$(grep API_KEY .env | cut -d= -f2)
 
 curl -X POST https://sous-titres.votre-domaine.tld/jobs \
   -H "X-API-Key: $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://exemple.com/video.mp4"}'
+  -F "url=https://exemple.com/video.mp4"
 # → {"id": "...", "status": "queued", ...}
+
+# ou en envoyant directement un fichier (mp4 ou wav) :
+curl -X POST https://sous-titres.votre-domaine.tld/jobs \
+  -H "X-API-Key: $API_KEY" \
+  -F "file=@/chemin/vers/video.mp4"
 
 curl https://sous-titres.votre-domaine.tld/jobs/<id> -H "X-API-Key: $API_KEY"
 # → poll jusqu'à "status":"done"

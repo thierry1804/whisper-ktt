@@ -1,12 +1,13 @@
 # whisper-service
 
-Service de sous-titrage : soumet une URL de vidéo/audio, extrait l'audio via ffmpeg et transcrit avec [faster-whisper](https://github.com/SYSTRAN/faster-whisper), renvoie des sous-titres `.srt`/`.vtt`.
+Service de sous-titrage : soumet une URL (mp4 ou wav) ou envoie directement un fichier (mp4 ou wav), extrait l'audio via ffmpeg et transcrit avec [faster-whisper](https://github.com/SYSTRAN/faster-whisper), renvoie des sous-titres `.srt`/`.vtt`.
 
 ## Fonctionnement
 
-1. `POST /jobs` avec une URL → renvoie un `id` de job (traitement asynchrone en file, un seul job à la fois).
-2. `GET /jobs/{id}` → statut du job (`queued`, `processing`, `done`, `error`).
-3. `GET /jobs/{id}/srt` et `GET /jobs/{id}/vtt` → téléchargent le fichier correspondant. **Chaque fichier est supprimé du serveur juste après son téléchargement** (récupérable une seule fois).
+1. `POST /jobs` (`multipart/form-data`) avec soit un champ `url` (mp4 ou wav), soit un champ `file` (upload direct d'un mp4 ou wav) → renvoie un `id` de job (traitement asynchrone en file, un seul job à la fois).
+2. `GET /jobs/{id}` → statut du job (`queued`, `converting`, `transcribing`, `cancelling`, `cancelled`, `done`, `error`) et `progress` (0.0 à 1.0, remis à zéro à chaque changement de statut : `converting` = extraction audio via ffmpeg, `transcribing` = transcription Whisper).
+3. `POST /jobs/{id}/cancel` → arrête un job en attente ou en cours. Si le job attendait en file, il passe directement à `cancelled`. S'il était en cours de traitement, il passe à `cancelling` (l'arrêt effectif du process en cours prend jusqu'à ~0.5s) puis `cancelled` une fois confirmé — repoller `GET /jobs/{id}` pour le voir. Renvoie 409 si le job est déjà terminé (`done`/`error`/`cancelled`).
+4. `GET /jobs/{id}/srt` et `GET /jobs/{id}/vtt` → téléchargent le fichier correspondant. **Chaque fichier est supprimé du serveur juste après son téléchargement** (récupérable une seule fois).
 
 Toutes les routes `/jobs*` nécessitent un header `X-API-Key`. `GET /health` reste public.
 

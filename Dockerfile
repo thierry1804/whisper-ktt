@@ -15,9 +15,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py transcriber.py ./
 
 ENV OUTPUT_DIR=/data/output
+ENV UPLOAD_DIR=/data/uploads
 ENV HF_HOME=/data/hf-cache
 
-RUN mkdir -p /data/output /data/hf-cache \
+RUN mkdir -p /data/output /data/uploads /data/hf-cache \
     && chown -R appuser:appuser /app /data
 
 USER appuser
