@@ -1,6 +1,7 @@
 """Cœur de transcription : source (URL ou fichier) -> cues courts -> SRT/VTT."""
 import io
 import re
+import struct
 import subprocess
 import threading
 import time
@@ -19,6 +20,30 @@ COMPUTE_TYPE = "int8"     # "int8" (CPU), "float16" ou "int8_float16" (GPU)
 LANGUAGE = None           # code langue, ou None pour laisser Whisper détecter
 LANGUAGE_DETECTION_THRESHOLD = 0.8   # confiance mini avant d'arrêter la détection
 LANGUAGE_DETECTION_SEGMENTS = 3      # nb de segments audio testés pour l'atteindre
+
+# Découpage manuel en tranches (pipeline Master Hub FR V1 §2.2) : Whisper est
+# entraîné sur des clips de ~30s, l'attention (et la fiabilité) se dégrade
+# sur des séquences continues bien plus longues, ce qui favorise les
+# hallucinations sur les fichiers longs. Chevauchement entre tranches
+# consécutives pour ne pas couper une phrase pile à la frontière ; la zone
+# de chevauchement est dédupliquée en son milieu (cf. _collect_words),
+# jamais laissée en double dans les mots collectés.
+CHUNK_DURATION_SEC = 30.0
+CHUNK_OVERLAP_SEC = 1.5
+
+# Seuils anti-hallucination (pipeline Master Hub FR V1 §1.4) — épinglés
+# explicitement plutôt que laissés aux défauts implicites de faster-whisper
+# (qui les égalent aujourd'hui, sans garantie si la librairie change).
+COMPRESSION_RATIO_THRESHOLD = 2.4
+LOG_PROB_THRESHOLD = -1.0
+NO_SPEECH_THRESHOLD = 0.6
+TEMPERATURE_FALLBACK = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+
+# Format audio produit par _extract_audio (WAV PCM 16 kHz mono 16 bits, en-tête
+# canonique) — utilisé pour découper l'audio brut en tranches indépendantes.
+_WAV_HEADER_SIZE = 44
+_SAMPLE_RATE = 16000
+_BYTES_PER_SAMPLE = 2
 
 # Filigrane ajouté en fin de chaque transcription (SRT + VTT) -------------
 WATERMARK_TEXT = "Transcription by MASTER HUB\nwww.killthetape.com"
@@ -286,6 +311,50 @@ TRANSCRIBE_RTF_ESTIMATE = 3.0
 TRANSCRIBE_HEARTBEAT_FLOOR = 0.01
 
 
+def _wav_header(pcm_len: int, sample_rate: int = _SAMPLE_RATE) -> bytes:
+    """En-tête WAV canonique (44 octets) pour un flux PCM mono 16 bits."""
+    byte_rate = sample_rate * _BYTES_PER_SAMPLE
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF", 36 + pcm_len, b"WAVE",
+        b"fmt ", 16, 1, 1, sample_rate, byte_rate, _BYTES_PER_SAMPLE, 16,
+        b"data", pcm_len,
+    )
+
+
+def _slice_wav(audio: bytes, start_sec: float, end_sec: float) -> bytes:
+    """Extrait une tranche de l'audio WAV brut et la réemballe avec un
+    en-tête WAV valide — chaque tranche doit être un fichier autonome pour
+    être passée indépendamment à Whisper."""
+    pcm = audio[_WAV_HEADER_SIZE:]
+    bytes_per_sec = _SAMPLE_RATE * _BYTES_PER_SAMPLE
+    start_byte = min(int(start_sec * bytes_per_sec), len(pcm))
+    end_byte = min(int(end_sec * bytes_per_sec), len(pcm))
+    # Aligné sur une frontière d'échantillon (2 octets) pour ne pas corrompre
+    # le flux PCM 16 bits.
+    start_byte -= start_byte % _BYTES_PER_SAMPLE
+    end_byte -= end_byte % _BYTES_PER_SAMPLE
+    return _wav_header(max(end_byte - start_byte, 0)) + pcm[start_byte:end_byte]
+
+
+def _chunk_starts(total_duration: float) -> list[float]:
+    """Bornes de départ (secondes) des tranches de CHUNK_DURATION_SEC, avec
+    un chevauchement de CHUNK_OVERLAP_SEC entre tranches consécutives. Un
+    fichier plus court qu'une tranche renvoie une seule tranche couvrant
+    tout l'audio — comportement identique à l'ancien mode "un seul appel"."""
+    if total_duration <= CHUNK_DURATION_SEC:
+        return [0.0]
+    stride = CHUNK_DURATION_SEC - CHUNK_OVERLAP_SEC
+    starts = []
+    t = 0.0
+    while True:
+        starts.append(t)
+        if t + CHUNK_DURATION_SEC >= total_duration:
+            break
+        t += stride
+    return starts
+
+
 class Cancelled(Exception):
     """Levée quand un job est annulé pendant la conversion ou la transcription."""
 
@@ -405,21 +474,29 @@ class Transcriber:
         initial_prompt: str | None = None,
         language: str | None = None,
     ) -> tuple[list[Word], str, float]:
-        """Transcription non-batchée : timestamps par mot fiables + moins de pertes."""
-        # Estimation immédiate de la durée à partir du WAV brut (16 kHz mono 16 bits,
-        # en-tête canonique 44 octets — c'est le format que produit _extract_audio).
-        # Nécessaire pour démarrer le heartbeat AVANT l'appel à model.transcribe()
-        # ci-dessous : ce dernier calcule le VAD et les features de tout l'audio de
-        # façon synchrone/bloquante avant de renvoyer `info.duration`, donc sans
-        # cette estimation, aucune progression ne serait visible pendant cette phase
-        # (le cas typique : un média sans parole, où aucun segment n'est jamais produit
-        # et où le VAD engloutit tout le temps de la phase "transcribing").
-        estimated_duration = max(len(audio) - 44, 0) / (16000 * 2)
+        """Transcrit l'audio par tranches de CHUNK_DURATION_SEC avec
+        chevauchement (pipeline Master Hub FR V1 §2.2-2.3) plutôt qu'en un
+        seul appel : réduit le risque d'hallucination/dérive sur les
+        fichiers longs. Le chevauchement entre deux tranches consécutives
+        est coupé en son milieu (temps global) — jamais laissé en double
+        dans les mots collectés. Un fichier ≤ CHUNK_DURATION_SEC tient dans
+        une seule tranche : comportement identique à l'ancien mode "un seul
+        appel" (aucune régression pour les fichiers courts déjà testés)."""
+        total_duration = max(len(audio) - _WAV_HEADER_SIZE, 0) / (_SAMPLE_RATE * _BYTES_PER_SAMPLE)
+        chunk_starts = _chunk_starts(total_duration)
+        # Frontière (temps global) entre la tranche i et la tranche i+1, au
+        # milieu de leur zone de chevauchement commune.
+        boundaries = [
+            chunk_starts[i] + CHUNK_DURATION_SEC - CHUNK_OVERLAP_SEC / 2
+            for i in range(len(chunk_starts) - 1)
+        ]
 
         words: list[Word] = []
+        detected_language: str | None = None
 
         # Progression : la valeur reportée ne redescend jamais (le max des
-        # estimations "heartbeat" et des positions réelles des segments).
+        # estimations "heartbeat" et des positions réelles, mises à l'échelle
+        # de la durée TOTALE — pas seulement de la tranche en cours).
         best_progress = 0.0
         progress_lock = threading.Lock()
         rtf = TRANSCRIBE_RTF_ESTIMATE
@@ -447,45 +524,74 @@ class Transcriber:
                     return
 
         hb_thread = None
-        if on_progress and estimated_duration:
-            hb_thread = threading.Thread(target=heartbeat, args=(estimated_duration,), daemon=True)
+        if on_progress and total_duration:
+            hb_thread = threading.Thread(target=heartbeat, args=(total_duration,), daemon=True)
             hb_thread.start()
 
-        segments, info = self.model.transcribe(
-            io.BytesIO(audio),
-            language=language if language is not None else LANGUAGE,
-            language_detection_threshold=LANGUAGE_DETECTION_THRESHOLD,
-            language_detection_segments=LANGUAGE_DETECTION_SEGMENTS,
-            vad_filter=VAD_ENABLED,
-            vad_parameters=VAD_PARAMETERS if VAD_ENABLED else None,
-            word_timestamps=True,
-            initial_prompt=initial_prompt,
-            # Défaut faster-whisper = True : chaque segment est conditionné sur le
-            # texte du précédent, ce qui favorise les répétitions d'un sous-titre
-            # à l'autre (cause documentée, cf. pipeline Master Hub FR V1 §1.1).
-            condition_on_previous_text=False,
-        )
-        language = info.language
-        duration = info.duration
-
         try:
-            for seg in segments:          # itérer déclenche le calcul
+            for idx, chunk_start in enumerate(chunk_starts):
                 if cancel_event is not None and cancel_event.is_set():
                     raise Cancelled("Transcription annulée")
-                if seg.words:
-                    words.extend(
-                        Word(w.start, min(w.end, w.start + WORD_MAX_DURATION), w.word)
-                        for w in seg.words
-                    )
-                else:
-                    words.append(
-                        Word(seg.start, min(seg.end, seg.start + WORD_MAX_DURATION), seg.text)
-                    )
-                if on_progress and info.duration:
-                    if seg.end > 0:
-                        # Recalibre le rythme estimé sur le rythme réel observé.
-                        rtf = max((time.monotonic() - start_ts) / seg.end, 0.1)
-                    report(min(seg.end / info.duration, 1.0))
+                chunk_end = min(chunk_start + CHUNK_DURATION_SEC, total_duration)
+                chunk_audio = _slice_wav(audio, chunk_start, chunk_end)
+                # Une fois la langue détectée sur la 1ère tranche, on la fige
+                # pour les suivantes : chaque tranche ne contient parfois que
+                # quelques mots, une détection indépendante par tranche
+                # risquerait de donner une langue différente d'une tranche à
+                # l'autre sur le même fichier.
+                chunk_language = language if language is not None else detected_language
+
+                segments, info = self.model.transcribe(
+                    io.BytesIO(chunk_audio),
+                    language=chunk_language,
+                    language_detection_threshold=LANGUAGE_DETECTION_THRESHOLD,
+                    language_detection_segments=LANGUAGE_DETECTION_SEGMENTS,
+                    vad_filter=VAD_ENABLED,
+                    vad_parameters=VAD_PARAMETERS if VAD_ENABLED else None,
+                    word_timestamps=True,
+                    initial_prompt=initial_prompt,
+                    # Défaut faster-whisper = True : chaque segment est conditionné
+                    # sur le texte du précédent, ce qui favorise les répétitions
+                    # d'un sous-titre à l'autre (cf. pipeline Master Hub FR V1 §1.1).
+                    condition_on_previous_text=False,
+                    compression_ratio_threshold=COMPRESSION_RATIO_THRESHOLD,
+                    log_prob_threshold=LOG_PROB_THRESHOLD,
+                    no_speech_threshold=NO_SPEECH_THRESHOLD,
+                    temperature=TEMPERATURE_FALLBACK,
+                )
+                if detected_language is None:
+                    detected_language = info.language
+
+                lower = boundaries[idx - 1] if idx > 0 else None
+                upper = boundaries[idx] if idx < len(boundaries) else None
+
+                for seg in segments:          # itérer déclenche le calcul
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise Cancelled("Transcription annulée")
+                    if seg.words:
+                        for w in seg.words:
+                            g_start = w.start + chunk_start
+                            g_end = min(w.end, w.start + WORD_MAX_DURATION) + chunk_start
+                            if lower is not None and g_end <= lower:
+                                continue  # déjà couvert par la tranche précédente
+                            if upper is not None and g_start >= upper:
+                                continue  # couvert par la tranche suivante
+                            words.append(Word(g_start, g_end, w.word))
+                    else:
+                        g_start = seg.start + chunk_start
+                        g_end = min(seg.end, seg.start + WORD_MAX_DURATION) + chunk_start
+                        in_overlap = (lower is not None and g_end <= lower) or (
+                            upper is not None and g_start >= upper
+                        )
+                        if not in_overlap:
+                            words.append(Word(g_start, g_end, seg.text))
+
+                    global_end = chunk_start + seg.end
+                    if on_progress and total_duration:
+                        if global_end > 0:
+                            # Recalibre le rythme estimé sur le rythme réel observé.
+                            rtf = max((time.monotonic() - start_ts) / global_end, 0.1)
+                        report(min(global_end / total_duration, 1.0))
         finally:
             stop_heartbeat.set()
             if hb_thread:
@@ -499,7 +605,7 @@ class Transcriber:
         if on_progress:
             report(1.0)
 
-        return words, language, duration
+        return words, detected_language, total_duration
 
     def transcribe(
         self,
