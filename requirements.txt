@@ -2,4 +2,5 @@ fastapi==0.141.1
 uvicorn[standard]==0.52.1
 pydantic==2.13.4
 faster-whisper==1.2.1
+av==18.1.0  # pinne : av>=19 a casse av.open(metadata_errors=...) utilise par faster-whisper 1.2.1 (05/10/2026)
 python-multipart==0.0.20

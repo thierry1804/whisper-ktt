@@ -18,19 +18,18 @@ from starlette.background import BackgroundTask
 
 from transcriber import (
     Cancelled,
-    CONTEXT_OPTION_PROMPTS,
-    OUTPUT_PROFILES,
-    REGISTER_PROMPTS,
+    DEFAULT_SUBTITLE_PRESET,
     Segment,
-    SPEECH_TYPE_PROMPTS,
+    SUBTITLE_PRESETS,
     SUPPORTED_LANGUAGES,
     Transcriber,
+    VALID_CONTEXT_OPTIONS,
+    VALID_REGISTERS,
+    VALID_SPEECH_TYPES,
     WATERMARK_DURATION,
     WATERMARK_GAP,
     WATERMARK_LEAD_SEC,
     WATERMARK_TEXT,
-    WRAP_WIDTH,
-    _build_initial_prompt,
     to_srt,
     to_vtt,
 )
@@ -88,15 +87,16 @@ class Job(BaseModel):
     vtt_path: str | None = None
     qc_path: str | None = None        # log QC (JSON) : cps + warnings par cue
     error: str | None = None
-    output_profile: str | None = None  # None = profil par défaut (42 car/ligne)
+    subtitle_preset: str | None = None  # None = preset par défaut (cf. DEFAULT_SUBTITLE_PRESET)
     language: str | None = None            # détectée par Whisper, connue une fois le job "done"
     output_basename: str | None = None     # Titre_Transcript_langue_KTT_AI_yyyymmdd (sans extension)
-    speech_type: str | None = None         # None = défaut "group" (cf. SPEECH_TYPE_PROMPTS)
-    context_options: list[str] = []        # sous-ensemble de CONTEXT_OPTION_PROMPTS
-    register: str | None = None            # None = défaut "standard" (cf. REGISTER_PROMPTS)
+    speech_type: str | None = None         # None = défaut "group" (cf. VALID_SPEECH_TYPES)
+    context_options: list[str] = []        # sous-ensemble de VALID_CONTEXT_OPTIONS
+    register: str | None = None            # None = défaut "standard" (cf. VALID_REGISTERS)
     forced_language: str | None = None     # None = détection auto (comportement historique)
     proper_nouns: list[str] = []           # glossaire optionnel (prompt + normalisation post-traitement)
-    initial_prompt: str | None = None      # prompt Whisper résolu, pour vérification/QA
+    initial_prompt: str | None = None      # prompt Whisper résolu — connu une fois le job "done"
+                                            # (composé dans la langue détectée, cf. 30/09/2026)
 
 
 # État partagé (en mémoire pour démarrer)
@@ -105,12 +105,6 @@ CANCEL_EVENTS: dict[str, threading.Event] = {}
 # Fichier uploadé (si la source du job est un upload direct, pas une URL) à
 # supprimer une fois le job terminé — même logique de nettoyage que les sorties.
 UPLOAD_PATHS: dict[str, Path] = {}
-# Largeur de ligne résolue pour chaque job (cf. output_profile) — gardée à part
-# du modèle Job pour ne pas exposer la valeur numérique interne au client.
-CHAR_LIMITS: dict[str, int] = {}
-# initial_prompt Whisper résolu pour chaque job (cf. _build_initial_prompt) —
-# transmis au worker séparément, comme CHAR_LIMITS.
-INITIAL_PROMPTS: dict[str, str] = {}
 QUEUE: asyncio.Queue[str] = asyncio.Queue()
 STATE: dict = {}
 
@@ -125,8 +119,6 @@ async def worker():
         upload_path = UPLOAD_PATHS.pop(job_id, None)
         if job.status == Status.cancelled:
             # Annulé pendant qu'il attendait encore en file.
-            CHAR_LIMITS.pop(job_id, None)
-            INITIAL_PROMPTS.pop(job_id, None)
             QUEUE.task_done()
             if upload_path:
                 upload_path.unlink(missing_ok=True)
@@ -148,21 +140,27 @@ async def worker():
             def on_progress(p: float) -> None:
                 job.progress = p
 
-            char_limit = CHAR_LIMITS.pop(job_id, WRAP_WIDTH)
-            initial_prompt = INITIAL_PROMPTS.pop(job_id, None)
-            segments, language, duration = await loop.run_in_executor(
+            segments, language, duration, resolved_prompt, removed_echoes, frame_rate = await loop.run_in_executor(
                 None,
                 lambda: transcriber.transcribe(
                     job.source,
                     on_phase=on_phase,
                     on_progress=on_progress,
                     cancel_event=cancel_event,
-                    char_limit=char_limit,
-                    initial_prompt=initial_prompt,
+                    subtitle_preset=job.subtitle_preset or DEFAULT_SUBTITLE_PRESET,
+                    speech_type=job.speech_type,
+                    context_options=job.context_options,
+                    register=job.register,
                     language=job.forced_language,
                     proper_nouns=job.proper_nouns,
                 ),
             )
+            # Composé après détection de la langue, DANS cette langue (cf.
+            # Transcriber.transcribe) : connu seulement une fois le job traité,
+            # pas dès la création (contrairement à l'ancien comportement où le
+            # prompt anglais par défaut était visible — et appliqué — avant
+            # même de savoir dans quelle langue était le média).
+            job.initial_prompt = resolved_prompt
             if not segments:
                 raise RuntimeError("Aucune parole détectée dans le média")
             # Ancré sur la durée réelle du média (pas sur la fin de la
@@ -188,6 +186,8 @@ async def worker():
             qc_path.write_text(
                 json.dumps(
                     {
+                        "subtitle_preset": job.subtitle_preset or DEFAULT_SUBTITLE_PRESET,
+                        "frame_rate": round(frame_rate, 3),
                         "cues": [
                             {
                                 "index": i,
@@ -199,9 +199,22 @@ async def worker():
                                     / max(seg.end - seg.start, 1e-6),
                                     1,
                                 ),
+                                "confidence": seg.confidence,
                                 "warnings": seg.warnings,
                             }
                             for i, seg in enumerate(segments)
+                        ],
+                        # Cues supprimés automatiquement (ex. écho du prompt sur
+                        # du silence) : jamais silencieux, toujours tracés ici
+                        # même si absents du SRT/VTT final.
+                        "removed": [
+                            {
+                                "start": round(seg.start, 3),
+                                "end": round(seg.end, 3),
+                                "text": seg.text,
+                                "warnings": seg.warnings,
+                            }
+                            for seg in removed_echoes
                         ],
                     },
                     ensure_ascii=False,
@@ -241,7 +254,7 @@ app = FastAPI(lifespan=lifespan, title="Service de sous-titrage")
 async def create_job(
     url: str | None = Form(None),
     file: UploadFile | None = File(None),
-    output_profile: str | None = Form(None),
+    subtitle_preset: str | None = Form(None),
     speech_type: str | None = Form(None),
     context_options: list[str] = Form([]),
     register: str | None = Form(None),
@@ -250,9 +263,13 @@ async def create_job(
 ):
     """Crée un job à partir d'une URL (mp4/wav) OU d'un fichier uploadé (mp4/wav) — pas les deux.
 
-    output_profile (optionnel) fixe les caractères/ligne selon le support de sortie
-    (normes ATAA) : "tv" (36), "video" (39), "streaming" (42), "cinema" (40).
-    Omis -> comportement historique (42 car/ligne), aucun changement pour les clients existants.
+    subtitle_preset (optionnel) fixe le jeu complet de règles de lisibilité et
+    de QC (lignes, car/ligne, CPS, durées, gap, délai 1er/dernier sous-titre) :
+    "dcp_smpte_bv21_technical", "dcp_cinema_fr_ktt", "tv_fr_ktt",
+    "vod_standard_ktt", "dcp_sme_fr_ktt", "tv_sme_fr_ktt", "vod_sdh_sme_ktt",
+    "transcription_tolerance_max_ktt" (8 presets de la fiche Master Hub,
+    05/10/2026), ou "video" (profil historique conservé tel quel, 39
+    car/ligne). Omis -> "video" par défaut (cf. DEFAULT_SUBTITLE_PRESET).
 
     speech_type, context_options, register (tous optionnels) composent le
     initial_prompt Whisper ("Contexte de transcription" côté Master Hub) :
@@ -282,26 +299,26 @@ async def create_job(
             status_code=400,
             detail="Fournir soit 'url', soit 'file' (multipart/form-data), pas les deux ni aucun des deux",
         )
-    if output_profile is not None and output_profile not in OUTPUT_PROFILES:
+    if subtitle_preset is not None and subtitle_preset not in SUBTITLE_PRESETS:
         raise HTTPException(
             status_code=400,
-            detail=f"output_profile invalide : {output_profile!r} (attendu : {', '.join(OUTPUT_PROFILES)})",
+            detail=f"subtitle_preset invalide : {subtitle_preset!r} (attendu : {', '.join(SUBTITLE_PRESETS)})",
         )
-    if speech_type is not None and speech_type not in SPEECH_TYPE_PROMPTS:
+    if speech_type is not None and speech_type not in VALID_SPEECH_TYPES:
         raise HTTPException(
             status_code=400,
-            detail=f"speech_type invalide : {speech_type!r} (attendu : {', '.join(SPEECH_TYPE_PROMPTS)})",
+            detail=f"speech_type invalide : {speech_type!r} (attendu : {', '.join(VALID_SPEECH_TYPES)})",
         )
-    if register is not None and register not in REGISTER_PROMPTS:
+    if register is not None and register not in VALID_REGISTERS:
         raise HTTPException(
             status_code=400,
-            detail=f"register invalide : {register!r} (attendu : {', '.join(REGISTER_PROMPTS)})",
+            detail=f"register invalide : {register!r} (attendu : {', '.join(VALID_REGISTERS)})",
         )
-    invalid_options = [o for o in context_options if o not in CONTEXT_OPTION_PROMPTS]
+    invalid_options = [o for o in context_options if o not in VALID_CONTEXT_OPTIONS]
     if invalid_options:
         raise HTTPException(
             status_code=400,
-            detail=f"context_options invalide(s) : {invalid_options!r} (attendu : {', '.join(CONTEXT_OPTION_PROMPTS)})",
+            detail=f"context_options invalide(s) : {invalid_options!r} (attendu : {', '.join(VALID_CONTEXT_OPTIONS)})",
         )
     if language is not None and language not in SUPPORTED_LANGUAGES:
         raise HTTPException(
@@ -335,22 +352,24 @@ async def create_job(
         source = url
 
     title = _sanitize_title(file.filename if file is not None else url)
-    resolved_prompt = _build_initial_prompt(speech_type, context_options, register, proper_nouns)
+    # initial_prompt n'est plus composé ici : il dépend de la langue, connue
+    # seulement une fois la transcription démarrée (cf. worker()/Transcriber.
+    # transcribe) — composer un prompt anglais par défaut avant même de
+    # savoir dans quelle langue est le média biaisait Whisper vers une sortie
+    # en anglais sur du contenu non anglophone (bug constaté en prod le
+    # 30/09/2026).
     job = Job(
         id=job_id,
         source=source,
         title=title,
-        output_profile=output_profile,
+        subtitle_preset=subtitle_preset,
         speech_type=speech_type,
         context_options=context_options,
         register=register,
         forced_language=language,
         proper_nouns=proper_nouns,
-        initial_prompt=resolved_prompt,
     )
     JOBS[job_id] = job
-    CHAR_LIMITS[job_id] = OUTPUT_PROFILES.get(output_profile, WRAP_WIDTH)
-    INITIAL_PROMPTS[job_id] = resolved_prompt
     CANCEL_EVENTS[job_id] = threading.Event()
     if upload_path is not None:
         UPLOAD_PATHS[job_id] = upload_path
